@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/py-audio",
+    "crates/audio",
+    "crates/blaudio",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/juso40/blaudio"
+
+[workspace.dependencies]
+py-audio = { path = "crates/py-audio" }
+audio = { path = "crates/audio" }
+blaudio = { path = "crates/blaudio" }
+
+pyo3 = "0.29"
+pyo3-stub-gen = "0.23"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "deny"
+todo = "warn"
+case_sensitive_file_extension_comparisons = "warn"
+unwrap_used = "deny"

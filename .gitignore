@@ -1,0 +1,7 @@
+native/target/
+texloader/_texloader.pyd
+__pycache__/
+*.pyc
+*.zip
+.ruff_cache/
+.zed/

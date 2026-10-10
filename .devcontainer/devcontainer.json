@@ -1,0 +1,20 @@
+{
+	"name": "blaudio-native",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"workspaceFolder": "/work",
+	"workspaceMount": "source=${localWorkspaceFolder},target=/work,type=bind",
+	"mounts": [
+		"source=blaudio-cargo,target=/usr/local/cargo/registry,type=volume",
+		"source=blaudio-target,target=/work/native/target,type=volume"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer"
+			]
+		}
+	},
+	"remoteUser": "root"
+}

@@ -1,0 +1,15 @@
+[project]
+name = "blaudio"
+version = "0.1"
+authors = [{ name = "juso" }]
+description = """\
+Runtime audio loading for Borderlands 2.
+"""
+
+
+[tool.sdkmod]
+name = "blaudio"
+license = { name = "MIT", url = "https://choosealicense.com/licenses/mit/" }
+download = "https://github.com/juso40/Willow-Audio-Loader/raw/refs/heads/main/blaudio.zip"
+supported_games = ["BL2"]
+uses_native_modules = true

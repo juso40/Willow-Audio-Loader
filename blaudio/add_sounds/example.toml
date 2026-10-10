@@ -1,0 +1,14 @@
+# One sound bank per manifest. See README.md for the schema and positioning.
+# AkBank'Transient.my_mod.ValdofWeapons'
+namespace = "blaudio" # required
+bank_name = "SFX" # required
+
+[[sound]]
+# AkEvent'Transient.blaudio.SFX.VineBoom'
+name = "VineBoom" # required, unique within this bank
+sound = "vine-boom.mp3" # required, relative to this manifest
+
+# Optional: playback positioning. Audio keeps its source channels.
+# 2d, 2d_panned, 3d (default), 3d_static, 3d_no_attenuation,
+# 3d_unspatialized, or weapon.
+positioning = "weapon"

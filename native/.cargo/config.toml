@@ -1,0 +1,17 @@
+[target.i686-pc-windows-gnullvm]
+linker = "i686-w64-mingw32-clang"
+ar = "i686-w64-mingw32-ar"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+# Keep parity with the gnullvm build: the module links the static CRT so it has
+# no VC runtime DLL dependency inside the game process.
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-gnu]
+linker = "i686-w64-mingw32-gcc"
+ar = "i686-w64-mingw32-ar"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"

@@ -1,0 +1,20 @@
+[package]
+name = "blaudio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_blaudio"
+# rlib alongside cdylib so the stub_gen binary can link the crate
+# the shipped artifact stays the cdylib (`blaudio/_blaudio.pyd`).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+py-audio.workspace = true
+audio.workspace = true
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py314", "generate-import-lib"] }
+pyo3-stub-gen = "0.23"
+
+[lints]
+workspace = true
