@@ -1,11 +1,3 @@
-"""Session-only allocation of bank, event and derived HIRC ids.
-
-Checks loaded AkObject ids and allocations made through this module.
-It cannot see unloaded banks, internal game HIRC nodes, or arbitrary
-banks another mod loads directly into Wwise.
-"""
-
-
 import re
 import secrets
 from collections.abc import Generator, Mapping
@@ -22,7 +14,7 @@ SoundKey = str
 _MASK = 0xFFFFFFFF
 _ATTENUATION_ID = 0x03F8F132
 # Keep in sync with native/crates/audio/src/craft.rs. Named allocations
-# reserve both weapon-only nodes too, even when initially used as 3D.
+# reserve both perspective-only nodes too, even when initially used as 3D.
 _DERIVED_MASKS = (0x534F554E, 0x41435449, 0x4D495852, 0x53574954, 0x54485244)
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -34,9 +26,26 @@ def identifier(value: str, label: str) -> str:
     return value
 
 
-def _scope(bank_name: str, namespace: str, modes: Mapping[SoundKey, str]) -> str:
-    if not modes:
-        raise ValueError("add: no sounds")
+def stop_event_names(
+    sounds: Mapping[SoundKey, object], stop_events: Mapping[SoundKey, str] | None
+) -> dict[SoundKey, str]:
+    """Validate companion names in the same case-insensitive event namespace."""
+    if stop_events is None:
+        stop_events = {}
+    if not isinstance(stop_events, Mapping):
+        raise ValueError("stop_events must be a mapping of sound names to stop event names")
+    if unknown := stop_events.keys() - sounds.keys():
+        raise ValueError(f"stop_events contains unknown sound keys: {sorted(map(repr, unknown))}")
+    seen: set[str] = set()
+    for name in (*sounds, *stop_events.values()):
+        identifier(name, "event name")
+        if name.casefold() in seen:
+            raise ValueError(f"duplicate event name ignoring case: {name!r}")
+        seen.add(name.casefold())
+    return dict(stop_events)
+
+
+def _scope(bank_name: str, namespace: str) -> str:
     identifier(namespace, "namespace")
     identifier(bank_name, "bank_name")
     return f"{namespace.casefold()}/{bank_name.casefold()}"
@@ -71,7 +80,7 @@ class IdRegistry:
             if not value:
                 continue
             path = object_path(obj)
-            if path not in self._objects.get(value, set()):
+            if path not in self._objects.get(value, ()):
                 occupied[value] = path
         return occupied
 
@@ -122,21 +131,32 @@ class IdRegistry:
         bank_name: str,
         namespace: str,
         modes: Mapping[SoundKey, str],
+        *,
+        stop_events: Mapping[SoundKey, str] | None = None,
+        source_masks: Mapping[SoundKey, tuple[int, ...]] | None = None,
     ) -> Generator[Allocation]:
         """Reserve all ids atomically. Release new ones on a pre-load failure."""
-        scope = _scope(bank_name, namespace, modes)
+        if not modes:
+            raise ValueError("add: no sounds")
+        scope = _scope(bank_name, namespace)
+        stops = stop_event_names(modes, stop_events)
         allocation = Allocation(0, {}, f"bank:{scope}")
         loaded = self._loaded_ids()
         try:
             allocation.bank_id = self._reserve(allocation.owner, (), loaded, allocation)
-            seen: set[str] = set()
             for key in modes:
-                identifier(key, "sound name")
                 owner = f"event:{scope}/name:{key.casefold()}"
-                if owner in seen:
-                    raise ValueError(f"duplicate sound name ignoring case: {key!r}")
-                seen.add(owner)
-                allocation.event_ids[key] = self._reserve(owner, _DERIVED_MASKS, loaded, allocation)
+                extra = () if source_masks is None else source_masks.get(key, ())
+                masks = (*_DERIVED_MASKS, *extra)
+                if 0 in masks or len(set(masks)) != len(masks):
+                    raise ValueError(f"derived node id masks collide for {key!r}")
+                allocation.event_ids[key] = self._reserve(owner, masks, loaded, allocation)
+            # Companion events need only their own event and action ids,
+            # not a second sound/media/mixer graph. The same /name owners
+            # make get_added_event work for both Play and Stop events.
+            for name in stops.values():
+                owner = f"event:{scope}/name:{name.casefold()}"
+                allocation.event_ids[name] = self._reserve(owner, (0x41435449,), loaded, allocation)
             yield allocation
         finally:
             if not allocation.committed:
@@ -163,7 +183,7 @@ class IdRegistry:
     def get_event(self, name: str, namespace: str, bank_name: str) -> UObject:
         """Find an event previously added with an automatic string key."""
         identifier(name, "sound name")
-        scope = _scope(bank_name, namespace, {name: "3d"})
+        scope = _scope(bank_name, namespace)
         owner = f"event:{scope}/name:{name.casefold()}"
         try:
             return self._events[self._names[owner]]
@@ -177,5 +197,6 @@ class IdRegistry:
             self._objects.setdefault(value, set()).add(object_path(obj))
 
 
+# Module reloads must retain reservations for banks still held by Wwise.
 if "registry" not in globals():
     registry = IdRegistry()

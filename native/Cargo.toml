@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/juso40/blaudio"
@@ -15,7 +15,6 @@ repository = "https://github.com/juso40/blaudio"
 [workspace.dependencies]
 py-audio = { path = "crates/py-audio" }
 audio = { path = "crates/audio" }
-blaudio = { path = "crates/blaudio" }
 
 pyo3 = "0.29"
 pyo3-stub-gen = "0.23"

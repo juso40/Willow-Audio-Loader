@@ -45,7 +45,7 @@ use crate::error::{AudioError, Result};
 /// A bank buffer aligned to 16 bytes.
 ///
 /// `LoadBank`'s prologue rejects anything misaligned with
-/// `(ptr & 0xf) == 0` before parsing (error `0x1F`), while a `Vec<u8>`
+/// `(ptr & 0xf) != 0` before parsing (error `0x1F`), while a `Vec<u8>`
 /// only guarantees 1-byte alignment. The engine may keep reading the
 /// buffer (embedded media is consumed lazily), so the allocation lives
 /// until `unload_bank`.
@@ -77,10 +77,6 @@ impl AlignedBank {
 
     fn as_ptr(&self) -> *const u8 {
         self.ptr
-    }
-
-    fn size(&self) -> usize {
-        self.len
     }
 
     /// The bank bytes as a slice.
@@ -119,55 +115,50 @@ pub fn load_bank(data: Vec<u8>) -> Result<u32> {
             &data[..data.len().min(4)]
         )));
     }
-    // Repeat loads are idempotent: the engine rejects a bank id it
-    // already holds, so short-circuit on the id from `BKHD` (+0xC, the
-    // same field the engine's own out-param reads).
-    let file_id = u32::from_le_bytes(data[0xC..0x10].try_into().expect("4 bytes"));
-    {
-        let registry = loaded().lock().expect("bank registry poisoned");
-        if let Some(existing) = registry.get(&file_id) {
-            return if existing.bytes() == data.as_slice() {
-                Ok(file_id)
-            } else {
-                Err(AudioError::format(format!(
-                    "bank id 0x{file_id:08x} is already loaded with different content"
-                )))
-            };
-        }
+    let size = u32::try_from(data.len()).map_err(|_| AudioError::format("bank exceeds 4 GiB"))?;
+    let file_id = crate::bank::header(&data)?.id;
+    // Serialize the ownership check and engine call so concurrent loads
+    // cannot replace and free a buffer Wwise still holds.
+    let mut registry = loaded().lock().expect("bank registry poisoned");
+    if let Some(existing) = registry.get(&file_id) {
+        return if existing.bytes() == data.as_slice() {
+            Ok(file_id)
+        } else {
+            Err(AudioError::format(format!(
+                "bank id 0x{file_id:08x} is already loaded with different content"
+            )))
+        };
     }
     let mut bank_id: u32 = 0;
     let bank = AlignedBank::new(&data)
         .ok_or_else(|| AudioError::format("cannot allocate an aligned bank buffer"))?;
-    let result = call_load_bank(bank.as_ptr(), bank.size() as u32, &mut bank_id);
+    let result = call_load_bank(bank.as_ptr(), size, &mut bank_id);
     if result != 1 {
         return Err(AudioError::format(format!(
             "AK::SoundEngine::LoadBank rejected the bank (AKRESULT {result})"
         )));
     }
-    loaded()
-        .lock()
-        .expect("bank registry poisoned")
-        .insert(bank_id, bank);
+    registry.insert(bank_id, bank);
     Ok(bank_id)
 }
 
 /// Unloads a bank loaded through [`load_bank`], releasing its bytes.
-/// `Ok(false)` when the id is not one of ours (game banks are the game's
-/// business).
+/// Returns `Ok(false)` without calling Wwise when we do not own the id.
+/// A failed unload retains the buffer because the engine may still use it.
 pub fn unload_bank(bank_id: u32) -> Result<bool> {
+    let mut registry = loaded().lock().expect("bank registry poisoned");
+    if !registry.contains_key(&bank_id) {
+        return Ok(false);
+    }
     let mut released: i32 = 0;
     let result = call_unload_bank(bank_id, &mut released);
-    let ours = loaded()
-        .lock()
-        .expect("bank registry poisoned")
-        .remove(&bank_id)
-        .is_some();
     if result != 1 {
         return Err(AudioError::format(format!(
             "AK::SoundEngine::UnloadBank failed (AKRESULT {result})"
         )));
     }
-    Ok(ours)
+    registry.remove(&bank_id);
+    Ok(true)
 }
 
 /// Posts a Wwise event id on a game object, returning the playing id.
@@ -175,12 +166,56 @@ pub fn unload_bank(bank_id: u32) -> Result<bool> {
 /// The id overload of `AK::SoundEngine::PostEvent` (`0x012e5590`) with
 /// no callback and no external sources. **Returns 0 when the engine
 /// cannot resolve the event id** (bank not loaded / no such event).
-/// Useful for to check whether the engine knows the provided eventId or not.
-/// Furthermore, it bypasses `AkEvent` objects and everything Unreal.
+/// This bypasses Unreal's `AkEvent` objects and playback bookkeeping.
 /// The game object should be registered (and listener-bound) first, see
 /// [`register_game_object`] and [`set_active_listeners`].
 pub fn post_event(event_id: u32, game_object: u32) -> u32 {
     call_post_event(event_id, game_object)
+}
+
+/// Queue Stop for an event, on one emitter or all emitters (`None`).
+/// True means Wwise accepted the action. False if unresolved, off-game,
+/// unknown event, or a negative fade. Does not poll playback status.
+pub fn stop_event(event_id: u32, game_object: Option<u32>, fade_ms: i32) -> bool {
+    if fade_ms < 0 {
+        return false;
+    }
+    const NAME: &str = "?ExecuteActionOnEvent@SoundEngine@AK@@YA?AW4AKRESULT@@KW4AkActionOnEventType@12@IJW4AkCurveInterpolation@@K@Z";
+    type Entry = extern "C" fn(u32, u32, u32, i32, u32, u32) -> i32;
+    static ENTRY: OnceLock<Option<Entry>> = OnceLock::new();
+    let entry = *ENTRY.get_or_init(|| {
+        let addr = crate::resolve::resolve_symbol(NAME)?;
+        // SAFETY: the symbol's __cdecl signature and all six arguments
+        // were verified in BL2 0x012e4d20 and TPS debug 0x01ec8350.
+        Some(unsafe { std::mem::transmute::<usize, Entry>(addr) })
+    });
+    // Stop = 0, AK_INVALID_GAME_OBJECT = UINT_MAX (all), linear = 4,
+    // AK_INVALID_PLAYING_ID = 0 (all instances of this event).
+    entry.is_some_and(|stop| stop(event_id, 0, game_object.unwrap_or(u32::MAX), fade_ms, 4, 0) == 1)
+}
+
+/// Stop one playing id with a linear fade. The engine API returns void,
+/// so true only means dispatched, not that a live playing id was found.
+/// False for id 0, negative fades, missing symbols, or off-game.
+pub fn stop_playing_id(playing_id: u32, fade_ms: i32) -> bool {
+    if playing_id == 0 || fade_ms < 0 {
+        return false;
+    }
+    const NAME: &str = "?StopPlayingID@SoundEngine@AK@@YAXKJW4AkCurveInterpolation@@@Z";
+    type Entry = extern "C" fn(u32, i32, u32);
+    static ENTRY: OnceLock<Option<Entry>> = OnceLock::new();
+    let entry = *ENTRY.get_or_init(|| {
+        let addr = crate::resolve::resolve_symbol(NAME)?;
+        // SAFETY: verified __cdecl void(ulong, long, enum) in BL2
+        // 0x012e2b00 and TPS debug 0x01ec4f60. Linear fade curve = 4.
+        Some(unsafe { std::mem::transmute::<usize, Entry>(addr) })
+    });
+    if let Some(stop) = entry {
+        stop(playing_id, fade_ms, 4);
+        true
+    } else {
+        false
+    }
 }
 
 /// Registers a game object id with the sound engine. `true` on success.
@@ -318,9 +353,8 @@ fn call_load_bank(ptr: *const u8, size: u32, out_bank_id: *mut u32) -> i32 {
     let entry = *ENTRY.get_or_init(|| {
         let addr = crate::resolve::resolve_symbol(NAME)?;
         // SAFETY: `addr` is the entry the game's symbol table names
-        // `NAME`. `Entry` is its recorded `__cdecl` signature
-        // . `ptr`/`size` describe a
-        // valid allocation owned by the caller for the duration of the
+        // `NAME`. `Entry` is its recorded `__cdecl` signature.
+        // `ptr` and `size` describe a valid allocation for the duration of the
         // call. `out_bank_id` points at a live local.
         Some(unsafe { std::mem::transmute::<usize, Entry>(addr) })
     });
@@ -347,5 +381,31 @@ fn call_unload_bank(bank_id: u32, out_released: *mut i32) -> i32 {
     match entry {
         Some(unload) => unload(bank_id, out_released),
         None => -1, // no entry: `AK_NotInitialized`
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_unloads_are_noops_and_failed_unloads_retain_owned_buffers() {
+        let bank_id: u32 = 0xfedcba98;
+        assert!(!unload_bank(bank_id).expect("unknown bank"));
+        let mut data = b"BKHD".to_vec();
+        data.extend(24u32.to_le_bytes());
+        for word in [62, bank_id, 0, 0, 0, 0] {
+            data.extend(word.to_le_bytes());
+        }
+        let buffer = AlignedBank::new(&data).expect("aligned allocation");
+        assert_eq!(buffer.as_ptr() as usize % 16, 0);
+        loaded().lock().expect("registry").insert(bank_id, buffer);
+        // No engine exists on this host, so unloading must fail without
+        // freeing the retained buffer or losing idempotent load behavior.
+        assert!(unload_bank(bank_id).is_err());
+        assert_eq!(load_bank(data.clone()).expect("retained bank"), bank_id);
+        data[20] = 1;
+        assert!(load_bank(data).is_err());
+        loaded().lock().expect("registry").remove(&bank_id);
     }
 }

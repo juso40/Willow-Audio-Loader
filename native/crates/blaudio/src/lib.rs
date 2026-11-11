@@ -7,10 +7,9 @@
 //! `to_wem`, `load_bank`, ...) and the raw engine entry shims
 //! (`post_event`, `register_game_object`, ...).
 
-
 use pyo3::prelude::*;
 
-/// Gathers stub metadata for `cargo run --bin stub_gen` (prints to stdout).
+/// Gather metadata used by `cargo run --bin stub_gen` to write the type stub.
 /// It reads no config file. The module name is fixed.
 pub fn stub_info() -> pyo3_stub_gen::Result<pyo3_stub_gen::StubInfo> {
     pyo3_stub_gen::StubInfo::from_project_root(
@@ -24,10 +23,13 @@ pub fn stub_info() -> pyo3_stub_gen::Result<pyo3_stub_gen::StubInfo> {
 #[pymodule]
 fn _blaudio(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(py_audio::craft_bank, module)?)?;
+    module.add_function(wrap_pyfunction!(py_audio::craft_tree_bank, module)?)?;
     module.add_function(wrap_pyfunction!(py_audio::to_wem, module)?)?;
     module.add_function(wrap_pyfunction!(py_audio::media_list, module)?)?;
     module.add_function(wrap_pyfunction!(py_audio::extract_media, module)?)?;
     module.add_function(wrap_pyfunction!(py_audio::post_event, module)?)?;
+    module.add_function(wrap_pyfunction!(py_audio::stop_event, module)?)?;
+    module.add_function(wrap_pyfunction!(py_audio::stop_playing_id, module)?)?;
     module.add_function(wrap_pyfunction!(py_audio::register_game_object, module)?)?;
     module.add_function(wrap_pyfunction!(py_audio::unregister_game_object, module)?)?;
     module.add_function(wrap_pyfunction!(py_audio::set_active_listeners, module)?)?;

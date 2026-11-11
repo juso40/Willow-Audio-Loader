@@ -1,5 +1,4 @@
 # One sound bank per manifest. See README.md for the schema and positioning.
-# AkBank'Transient.my_mod.ValdofWeapons'
 namespace = "blaudio" # required
 bank_name = "SFX" # required
 
@@ -10,5 +9,17 @@ sound = "vine-boom.mp3" # required, relative to this manifest
 
 # Optional: playback positioning. Audio keeps its source channels.
 # 2d, 2d_panned, 3d (default), 3d_static, 3d_no_attenuation,
-# 3d_unspatialized, or weapon.
-positioning = "weapon"
+# 3d_unspatialized, or perspective.
+positioning = "perspective"
+
+# Optional: true repeats until explicitly stopped. Defaults to false.
+# Posting again starts another instance. See README.md for stop helpers.
+loop = false
+
+# Optional volume offset in decibels (-96 to +12). Fractional values work too.
+# Applies to every clip and branch in this event. 0 leaves volume unchanged.
+gain = 0
+
+# Optional: create a normal AkEvent that stops this sound on its posting actor.
+# No second audio file needed. Name must be unique among all events in this bank.
+# stop_event = "StopVineBoom"

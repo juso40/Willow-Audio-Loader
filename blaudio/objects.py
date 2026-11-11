@@ -1,45 +1,15 @@
-"""Create the Unreal objects that make new audio referenceable in-game.
-
-Raw Wwise ids only reach `play_id`. Everything else in the game (Kismet
-`Behavior_PostAkEvent`, `AnimNotify_AkEvent`, other mods listing
-`find_all("AkEvent")`, ...) works with `AkEvent`/`AkBank` *objects*, so
-`add` creates one bank object and one event object per sound.
-
-Id wiring comes from the game's own script (`Engine/Classes/AkObject.uc`
-and `AkEvent.uc`): `AkObject.ShortId` is the Wwise id on every Ak
-object, and `AkEvent.RequiredBank` links an event to its `AkBank`.
-
-Objects go under the `Transient` package with keep-alive object flags.
-"""
-
-
-
 import unrealsdk
-from mods_base import ENGINE
+from mods_base import ENGINE, ObjectFlags
 from unrealsdk import unreal
 from unrealsdk.unreal import UObject
 
 __all__ = [
-    "DEFAULT_PACKAGE",
-    "KEEP_ALIVE_FLAGS",
     "create_bank",
     "create_event",
     "find_event",
     "object_path",
     "relink_event",
 ]
-
-#: Conventional package name for callers that want `Transient.blaudio`.
-#: Bare names are placed directly under `Transient`; dotted names create
-#: package Outers. Named additions use their namespace instead.
-DEFAULT_PACKAGE = "blaudio"
-
-#: Object flags that keep a constructed object alive across garbage
-#: collections. `0x4000` is the keep-alive bit unrealsdk itself uses
-#: (`keep_alive_willow` in its sources), `0x4_0000_0000` the companion
-#: bit that persistent object construction uses (the usual
-#: `RF_Public|RF_Standalone|RF_ROOT_SET` recipe).
-KEEP_ALIVE_FLAGS = 0x400004000
 
 
 def object_path(obj: UObject) -> str:
@@ -91,20 +61,26 @@ def find_event(target: str | unreal.UObject) -> UObject:
     return event
 
 
-def relink_event(event: UObject, event_id: int, bank: UObject) -> None:
+def relink_event(event: UObject, event_id: int, bank: UObject, *, voice: bool | None = None) -> None:
     """Point an existing event at a loaded replacement bank for this session.
 
     Keep the object identity so every existing reference sees the new audio.
-    Restore both properties if either assignment fails. Never save packages.
+    Restore changed properties if an assignment fails. Never save packages.
+    `voice=None` preserves the original event's voice flag.
     """
     previous_id, previous_bank = event.ShortId, event.RequiredBank
+    previous_voice = event.bVoice if voice is not None else None
     with unreal.notify_changes():
         try:
             event.ShortId = _signed_short_id(event_id)
             event.RequiredBank = bank
+            if voice is not None:
+                event.bVoice = voice
         except Exception:
             event.ShortId = previous_id
             event.RequiredBank = previous_bank
+            if voice is not None:
+                event.bVoice = previous_voice
             raise
 
 
@@ -135,5 +111,5 @@ def _construct(cls: str, name: str, *, outer: UObject | None = None) -> UObject:
         name=name,
         template_obj=template,
     )
-    gobj.ObjectFlags |= KEEP_ALIVE_FLAGS
+    gobj.ObjectFlags |= ObjectFlags.KEEP_ALIVE | ObjectFlags.ALLOW_CROSS_PACKAGE_REFERENCES
     return gobj

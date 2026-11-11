@@ -5,6 +5,7 @@ import builtins
 import typing
 __all__ = [
     "craft_bank",
+    "craft_tree_bank",
     "extract_media",
     "get_id_from_string",
     "load_bank",
@@ -13,15 +14,17 @@ __all__ = [
     "post_event",
     "register_game_object",
     "set_active_listeners",
+    "stop_event",
+    "stop_playing_id",
     "to_wem",
     "unload_bank",
     "unregister_game_object",
 ]
 
-def craft_bank(bank_id: builtins.int, bank_name: typing.Optional[builtins.str], event_ids: typing.Sequence[builtins.int], wems: typing.Sequence[typing.Sequence[builtins.int]], positioning: typing.Optional[typing.Sequence[builtins.str]] = None) -> builtins.list[builtins.int]:
+def craft_bank(bank_id: builtins.int, bank_name: typing.Optional[builtins.str], event_ids: typing.Sequence[builtins.int], wems: typing.Sequence[typing.Sequence[builtins.int]], positioning: typing.Optional[typing.Sequence[builtins.str]] = None, looping: typing.Optional[typing.Sequence[builtins.bool]] = None, stop_event_ids: typing.Optional[typing.Sequence[typing.Optional[builtins.int]]] = None) -> builtins.list[builtins.int]:
     r"""
     Builds a minimal bank with brand-new sounds and returns the bytes.
-    
+
     One Wwise event per entry: `event_ids[i]` plays `wems[i]`. Each entry
     is any common audio format (WAV, MP3, FLAC, OGG, AAC, ...) or a
     `.wem`. Non-`.wem` input is decoded to PCM. `bank_name` names the
@@ -30,9 +33,21 @@ def craft_bank(bank_id: builtins.int, bank_name: typing.Optional[builtins.str], 
     ids would collide through the internal derivation (pick
     well-separated event ids). `positioning` optionally supplies one
     mode per event: `2d`, `2d_panned`, `3d`, `3d_static`,
-    `3d_no_attenuation`, `3d_unspatialized`, or `weapon`. Default `3d`
-    preserves the donor behavior. `weapon` selects first-person 2D and
-    third-person 3D using the game's switch. See docs/positioning.md.
+    `3d_no_attenuation`, `3d_unspatialized`, or `perspective`.
+    Default `3d` preserves the donor behavior. `perspective` selects first-person 2D and
+    third-person 3D using the game's switch. `looping` optionally supplies
+    one boolean per event (default false). True repeats until stopped.
+    `stop_event_ids` optionally supplies a companion Stop event id per
+    sound (None entries omit it), scoped to the posting game object.
+    """
+
+def craft_tree_bank(bank_id: builtins.int, bank_name: typing.Optional[builtins.str], event_ids: typing.Sequence[builtins.int], sources: typing.Sequence[typing.Any], positioning: typing.Sequence[builtins.str], looping: typing.Sequence[builtins.bool], stop_event_ids: typing.Sequence[typing.Optional[builtins.int]], routing: typing.Sequence[builtins.str], gain: typing.Optional[typing.Sequence[builtins.float]] = None) -> builtins.list[builtins.int]:
+    r"""
+    Build a bank of validated selection-tree specs (normally use Python SoundPool/Switch).
+    Pools are step containers: one selection per event post. State/switch
+    branches may nest. None children are explicitly silent. Routing chooses
+    an existing Init-bank bus, never creates or changes a global game state.
+    `gain` optionally supplies one dB offset per event (-96..+12, default 0).
     """
 
 def extract_media(pck_path: builtins.str, media_id: builtins.int) -> builtins.list[builtins.int]:
@@ -50,7 +65,7 @@ def get_id_from_string(name: builtins.str) -> builtins.int:
 def load_bank(data: typing.Sequence[builtins.int]) -> builtins.int:
     r"""
     Loads a bank into Wwise from memory and returns its bank id.
-    
+
     Takes the bytes from `craft_bank` or a stock `.bnk` file. This is the
     entry the game's script surface lacks (`AkLoadBank (Nonfunctional)`):
     it calls `AK::SoundEngine::LoadBank` on the game thread. Raises when
@@ -67,7 +82,7 @@ def pck_probe(path: builtins.str) -> builtins.str:
     r"""
     Dumps a Wwise `.pck`: header, then every bank and stream entry with
     the media ids `extract_media` accepts. Reads files only.
-    
+
     Pure file-format work, works outside the game. Raises on a missing or
     malformed archive.
     """
@@ -75,7 +90,7 @@ def pck_probe(path: builtins.str) -> builtins.str:
 def post_event(event_id: builtins.int, game_object: builtins.int) -> builtins.int:
     r"""
     Posts a raw Wwise event id on a game object and returns the playing id.
-    
+
     Direct `AK::SoundEngine::PostEvent`, bypassing `AkEvent` objects and
     everything Unreal. Returns 0 when the engine cannot resolve the id
     (bank not loaded / no such event). Register and listener-bind the
@@ -93,10 +108,27 @@ def set_active_listeners(game_object: builtins.int, mask: builtins.int) -> built
     Sounds posted on an unbound game object can be silent.
     """
 
+def stop_event(event_id: builtins.int, game_object: typing.Optional[builtins.int] = None, fade_ms: builtins.int = 0) -> builtins.bool:
+    r"""
+    Stop an event's instances, optionally restricted to a game object.
+
+    None targets all emitters, not game object 0. `fade_ms` uses a linear
+    fade. True means Wwise accepted the queued action, not that playback
+    has already stopped. False when unresolved, unknown, or off-game.
+    """
+
+def stop_playing_id(playing_id: builtins.int, fade_ms: builtins.int = 0) -> builtins.bool:
+    r"""
+    Stop one playing id returned by post_event, with an optional linear fade.
+
+    True means the native void API was called, not a playback-status check.
+    False for playing id 0, when unresolved, or off-game.
+    """
+
 def to_wem(data: typing.Sequence[builtins.int]) -> builtins.list[builtins.int]:
     r"""
     Normalizes any audio to a `.wem` the bank crafter embeds.
-    
+
     A Wwise `.wem` (Vorbis, PCM or ADPCM) passes through untouched.
     Anything else (WAV, MP3, FLAC, OGG, AAC, ...) is decoded to PCM and
     wrapped in a PCM `.wem`. The output keeps the source channels and
@@ -114,4 +146,3 @@ def unregister_game_object(game_object: builtins.int) -> builtins.bool:
     r"""
     Unregisters a game object id. `True` on success.
     """
-

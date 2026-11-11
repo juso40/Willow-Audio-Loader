@@ -36,7 +36,7 @@ pub struct Chunk<'a> {
 /// The interpreted head of a `BKHD` chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BankHeader {
-    /// Bank format version (`62` in every observed bank).
+    /// Bank format version (`62` for generated BL2 banks).
     pub version: u32,
     /// The bank id (matches the `.pck` entry id).
     pub id: u32,
@@ -67,7 +67,7 @@ pub fn chunks(data: &[u8]) -> Result<Vec<Chunk<'_>>> {
         id.copy_from_slice(&data[pos..pos + 4]);
         let size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
             as usize;
-        let payload = data.get(pos + 8..pos + 8 + size).ok_or_else(|| {
+        let payload = data[pos + 8..].get(..size).ok_or_else(|| {
             AudioError::format(format!(
                 "chunk {:?} at {pos:#x} claims {size} bytes, overruns the file",
                 String::from_utf8_lossy(&id)
@@ -153,12 +153,16 @@ pub fn embedded_media(data: &[u8], media_id: u32) -> Result<&[u8]> {
         .find(|chunk| chunk.id == *b"DATA")
         .ok_or_else(|| AudioError::format("DIDX present but no DATA chunk"))?;
     let start = entry.offset as usize;
-    let end = start + entry.size as usize;
-    data_chunk.payload.get(start..end).ok_or_else(|| {
-        AudioError::format(format!(
-            "media 0x{media_id:08x} spans {start:#x}..{end:#x}, outside the DATA chunk"
-        ))
-    })
+    data_chunk
+        .payload
+        .get(start..)
+        .and_then(|tail| tail.get(..entry.size as usize))
+        .ok_or_else(|| {
+            AudioError::format(format!(
+                "media 0x{media_id:08x} at {start:#x} claims {} bytes, outside the DATA chunk",
+                entry.size
+            ))
+        })
 }
 
 /// One probe line: bank head, chunk list summary and embedded media ids.

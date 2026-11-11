@@ -17,10 +17,18 @@ fn main() {
         .modules
         .get(MODULE)
         .unwrap_or_else(|| panic!("{MODULE} missing from stub info"));
-    let text = module.to_string();
+    // The generator indents blank docstring lines. Keep generated files
+    // free of trailing whitespace too.
+    let text = module
+        .to_string()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
     // `<root>/native/crates/blaudio` -> `<root>/blaudio/_blaudio.pyi`.
-    let out = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../blaudio/_blaudio.pyi");
+    let out =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../blaudio/_blaudio.pyi");
     std::fs::write(&out, &text).expect("failed to write _blaudio.pyi");
     println!("wrote {} ({} bytes)", out.display(), text.len());
 }

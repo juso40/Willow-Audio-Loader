@@ -10,11 +10,15 @@ name = "_blaudio"
 # the shipped artifact stays the cdylib (`blaudio/_blaudio.pyd`).
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Only the shipped extension skips libpython linkage. Host stub generation
+# and tests embed Python and must link it normally.
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 py-audio.workspace = true
-audio.workspace = true
-pyo3 = { workspace = true, features = ["extension-module", "abi3-py314", "generate-import-lib"] }
-pyo3-stub-gen = "0.23"
+pyo3 = { workspace = true, features = ["abi3-py314", "generate-import-lib"] }
+pyo3-stub-gen.workspace = true
 
 [lints]
 workspace = true

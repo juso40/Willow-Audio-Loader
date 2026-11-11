@@ -21,9 +21,10 @@ def main() -> None:
         environment.pop(name, None)
 
     subprocess.run(
-        ["cargo", "build", "--release", "-p", "blaudio", "--lib", "--target", TARGET],
+        ["cargo", "build", "--release", "-p", "blaudio", "--lib", "--features", "extension-module", "--target", TARGET],
         cwd=NATIVE,
-        env=environment | {
+        env=environment
+        | {
             "PYO3_CROSS": "1",
             "PYO3_CROSS_PYTHON_VERSION": "3.14",
             "PYO3_BUILD_EXTENSION_MODULE": "1",

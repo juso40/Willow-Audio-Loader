@@ -1,6 +1,6 @@
 [project]
 name = "blaudio"
-version = "0.1"
+version = "1.0"
 authors = [{ name = "juso" }]
 description = """\
 Runtime audio loading for Borderlands 2.

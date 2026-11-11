@@ -53,17 +53,12 @@ pub fn decode_to_pcm16(bytes: &[u8]) -> Result<PcmAudio> {
         .default_track()
         .ok_or_else(|| AudioError::format("audio has no decodable track"))?;
     let track_id = track.id;
-    let mut channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count() as u16)
-        .unwrap_or(1);
-    let mut sample_rate = track.codec_params.sample_rate.unwrap_or(44_100);
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| AudioError::format(format!("unsupported audio codec: {e}")))?;
 
     let mut data = Vec::new();
+    let mut geometry = None;
     loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
@@ -83,18 +78,21 @@ pub fn decode_to_pcm16(bytes: &[u8]) -> Result<PcmAudio> {
             Err(e) => return Err(AudioError::format(format!("cannot decode audio: {e}"))),
         };
         let spec = *decoded.spec();
-        channels = spec.channels.count() as u16;
-        sample_rate = spec.rate;
-        let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        let current = (spec.channels.count() as u16, spec.rate);
+        if *geometry.get_or_insert(current) != current {
+            return Err(AudioError::format(
+                "audio changes channel count or sample rate midstream",
+            ));
+        }
+        let mut samples = SampleBuffer::<i16>::new(decoded.capacity() as u64, spec);
         samples.copy_interleaved_ref(decoded);
         for sample in samples.samples() {
-            let clamped = sample.clamp(-1.0, 1.0);
-            data.extend_from_slice(&((clamped * i16::MAX as f32).round() as i16).to_le_bytes());
+            data.extend_from_slice(&sample.to_le_bytes());
         }
     }
-    if data.is_empty() {
-        return Err(AudioError::format("audio decoded to zero samples"));
-    }
+    let (channels, sample_rate) = geometry
+        .filter(|_| !data.is_empty())
+        .ok_or_else(|| AudioError::format("audio decoded to zero samples"))?;
     Ok(PcmAudio {
         data,
         channels,
@@ -122,9 +120,5 @@ pub fn to_wem(bytes: &[u8]) -> Result<Vec<u8>> {
         return Ok(bytes.to_vec());
     }
     let pcm = decode_to_pcm16(bytes)?;
-    Ok(crate::wem::write_pcm_wem(
-        &pcm.data,
-        pcm.channels,
-        pcm.sample_rate,
-    ))
+    crate::wem::write_pcm_wem(&pcm.data, pcm.channels, pcm.sample_rate)
 }

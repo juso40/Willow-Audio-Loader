@@ -1,4 +1,5 @@
-//! Crafting a minimal "new audio" bank: one Wwise event per sound.
+//! Crafting a minimal "new audio" bank: one Play event per sound, with
+//! optional companion Stop events sharing the same target.
 //!
 //! The default 3D path uses four `HIRC` objects per event plus media
 //! in `DIDX`/`DATA`, with one shared attenuation object:
@@ -12,7 +13,7 @@
 //! Attenuation  (type 0x0E): one shared leaf, verbatim from the donor
 //! ```
 //!
-//! Weapon positioning adds a perspective switch and a second sound node.
+//! Perspective positioning adds a perspective switch and a second sound node.
 //! The first-person voice inherits 2D. The third-person voice overrides
 //! it with 3D. Both reference the same media. The switch comes from
 //! Startup_SFX event `0xad34538a`.
@@ -29,13 +30,16 @@
 //! (a parentless sound posts and resolves but never makes a sound).
 //!
 //! The crafter copies unknown fields verbatim from the donor and patches
-//! only the identified ones, including positioning in weapon mode.
+//! only the identified ones, including positioning in perspective mode.
 //! The size hint has unknown semantics at
 //! +20: shipped values range from 0 to 9522x the media size and
 //! everything plays, so it is a hint, not a constraint. We write the
 //! media length there. `NewSound::size_hint` overrides it.
 
 use crate::error::{AudioError, Result};
+
+mod tree;
+pub use tree::{NewEvent, Routing, Selection, SoundSource, craft_events};
 
 /// Bank format version claimed in `BKHD` (matches the template bank).
 const BANK_VERSION: u32 = 62;
@@ -130,9 +134,9 @@ pub enum Positioning {
     Unattenuated,
     /// Dynamic 3D attenuation without direction-based spatialization.
     Unspatialized,
-    /// The Vladof shot's perspective switch: 2D in first person, 3D in
+    /// General FirstOrThirdPerson switch: 2D in first person, 3D in
     /// third person. The game must set the switch on the posting object.
-    Weapon,
+    Perspective,
 }
 
 impl std::str::FromStr for Positioning {
@@ -146,10 +150,10 @@ impl std::str::FromStr for Positioning {
             "3d_static" => Ok(Self::Static),
             "3d_no_attenuation" => Ok(Self::Unattenuated),
             "3d_unspatialized" => Ok(Self::Unspatialized),
-            "weapon" => Ok(Self::Weapon),
+            "perspective" => Ok(Self::Perspective),
             _ => Err(AudioError::format(format!(
                 "unknown positioning {value:?}. Expected 2d, 2d_panned, 3d, \
-                 3d_static, 3d_no_attenuation, 3d_unspatialized or weapon"
+                 3d_static, 3d_no_attenuation, 3d_unspatialized or perspective"
             ))),
         }
     }
@@ -157,10 +161,10 @@ impl std::str::FromStr for Positioning {
 
 impl Positioning {
     /// BL2 SetPositioningParams bytes. These are variable-length: three
-    /// for explicit 2D, twelve for game-defined 3D. Weapon's root is 2D.
+    /// for explicit 2D, twelve for game-defined 3D. Perspective's root is 2D.
     fn parameters(self) -> Vec<u8> {
         match self {
-            Self::Flat | Self::Weapon => vec![1, 0, 0],
+            Self::Flat | Self::Perspective => vec![1, 0, 0],
             Self::Panned => vec![1, 0, 1],
             Self::Spatial | Self::Static | Self::Unattenuated | Self::Unspatialized => {
                 let mut params = MIXER_TEMPLATE[23..35].to_vec();
@@ -192,26 +196,34 @@ pub struct NewSound {
     pub size_hint: Option<u32>,
     /// How the bank positions the sound. Does not downmix the media.
     pub positioning: Positioning,
+    /// Repeat until stopped (AkPropID_Loop = 0). False preserves the
+    /// donor's default loop count of 1, i.e. one-shot playback.
+    pub looping: bool,
+    /// Optional companion event whose Stop action targets this sound's
+    /// Play target, on the game object posting the Stop event.
+    pub stop_event_id: Option<u32>,
 }
 
-/// Builds a minimal bank (version [`BANK_VERSION`]) with one event per
-/// sound, wired event -> Play action -> sound -> embedded media, named
+/// Builds a minimal bank (version [`BANK_VERSION`]) with one Play event per
+/// sound and optional companion Stop events. Wired Play event -> action ->
+/// sound -> embedded media, named
 /// `bank_name` in its `STID` entry.
 ///
 /// Chunk order follows the shipped banks: `BKHD`, `DIDX`, `DATA`,
 /// `HIRC`, `STID` (chunks are back to back, no padding). The result is
 /// exactly what `wwise::load_bank` takes.
 pub fn craft_bank(bank_id: u32, bank_name: &str, sounds: &[NewSound]) -> Result<Vec<u8>> {
-    if sounds.is_empty() {
-        return Err(AudioError::format("craft_bank: no sounds"));
+    if bank_id == 0 || sounds.is_empty() {
+        return Err(AudioError::format(
+            "craft_bank: need a nonzero bank id and sounds",
+        ));
     }
     if bank_name.is_empty() || bank_name.len() > 255 {
         return Err(AudioError::format(
             "craft_bank: bank_name must be 1..=255 bytes",
         ));
     }
-    let mut ids = std::collections::HashSet::new();
-    ids.insert(ATTENUATION_ID);
+    let mut ids = std::collections::HashSet::from([0, ATTENUATION_ID]);
     for sound in sounds {
         let mut object_ids = vec![
             sound.event_id,
@@ -219,11 +231,14 @@ pub fn craft_bank(bank_id: u32, bank_name: &str, sounds: &[NewSound]) -> Result<
             sound.event_id ^ ACTION_ID_XOR,
             sound.event_id ^ MIXER_ID_XOR,
         ];
-        if sound.positioning == Positioning::Weapon {
+        if sound.positioning == Positioning::Perspective {
             object_ids.extend([
                 sound.event_id ^ SWITCH_ID_XOR,
                 sound.event_id ^ THIRD_PERSON_ID_XOR,
             ]);
+        }
+        if let Some(stop_id) = sound.stop_event_id {
+            object_ids.extend([stop_id, stop_id ^ ACTION_ID_XOR]);
         }
         for id in object_ids {
             if !ids.insert(id) {
@@ -258,24 +273,22 @@ pub fn craft_bank(bank_id: u32, bank_name: &str, sounds: &[NewSound]) -> Result<
     let mut data = Vec::new();
     for (sound, (media, _)) in sounds.iter().zip(&medias) {
         let media_id = sound.event_id ^ SOUND_ID_XOR;
-        push_u32(&mut didx, media_id);
-        push_u32(&mut didx, data.len() as u32);
-        push_u32(&mut didx, media.len() as u32);
-        data.extend_from_slice(media);
+        push_media(&mut didx, &mut data, media_id, media)?;
     }
 
-    // HIRC: four nodes per spatial event, six per weapon event, then
-    // one shared attenuation leaf. Parent ids link each voice to its
-    // switch or mixer.
+    // HIRC: four nodes per spatial event, six per perspective event, then
+    // one shared attenuation leaf. Each optional Stop adds two nodes.
+    // Parent ids link each voice to its switch or mixer.
     let mut hirc = Vec::new();
     let object_count: usize = sounds
         .iter()
         .map(|sound| {
-            if sound.positioning == Positioning::Weapon {
+            let base = if sound.positioning == Positioning::Perspective {
                 6
             } else {
                 4
-            }
+            };
+            base + if sound.stop_event_id.is_some() { 2 } else { 0 }
         })
         .sum();
     push_u32(&mut hirc, (object_count + 1) as u32);
@@ -285,7 +298,7 @@ pub fn craft_bank(bank_id: u32, bank_name: &str, sounds: &[NewSound]) -> Result<
         let action_id = sound.event_id ^ ACTION_ID_XOR;
         let media_id = sound_id; // derived the same way, one media per sound
 
-        let mut sound_body = SOUND_TEMPLATE;
+        let mut sound_body = SOUND_TEMPLATE.to_vec();
         sound_body[0..4].copy_from_slice(&sound_id.to_le_bytes());
         sound_body[6..8].copy_from_slice(&codec_id.to_le_bytes());
         sound_body[12..16].copy_from_slice(&media_id.to_le_bytes());
@@ -293,23 +306,25 @@ pub fn craft_bank(bank_id: u32, bank_name: &str, sounds: &[NewSound]) -> Result<
         let hint = sound.size_hint.unwrap_or(media.len() as u32);
         sound_body[20..24].copy_from_slice(&hint.to_le_bytes());
         sound_body[24..28].copy_from_slice(&(media.len() as u32).to_le_bytes());
-        let target_id = if sound.positioning == Positioning::Weapon {
+        let target_id = if sound.positioning == Positioning::Perspective {
             let switch_id = sound.event_id ^ SWITCH_ID_XOR;
             let third_id = sound.event_id ^ THIRD_PERSON_ID_XOR;
             // Both voices belong to the switch. First person inherits
             // 2D from the mixer. Third person overrides it with 3D.
             sound_body[35..39].copy_from_slice(&switch_id.to_le_bytes());
-            push_object(&mut hirc, 0x02, &sound_body);
-            let mut third_body = sound_body.to_vec();
+            let mut third_body = sound_body.clone();
             third_body[0..4].copy_from_slice(&third_id.to_le_bytes());
             // SetPositioningParams consumes one byte for inheritance,
             // or twelve for an explicit game-defined 3D override.
             third_body.splice(43..44, Positioning::Spatial.parameters());
+            set_looping(&mut sound_body, sound.looping);
+            set_looping(&mut third_body, sound.looping);
+            push_object(&mut hirc, 0x02, &sound_body);
             push_object(&mut hirc, 0x02, &third_body);
             push_object(
                 &mut hirc,
                 0x06,
-                &weapon_switch(switch_id, mixer_id, sound_id, third_id),
+                &perspective_switch(switch_id, mixer_id, sound_id, third_id),
             );
 
             push_object(
@@ -320,6 +335,7 @@ pub fn craft_bank(bank_id: u32, bank_name: &str, sounds: &[NewSound]) -> Result<
             switch_id
         } else {
             sound_body[35..39].copy_from_slice(&mixer_id.to_le_bytes());
+            set_looping(&mut sound_body, sound.looping);
             push_object(&mut hirc, 0x02, &sound_body);
             push_object(
                 &mut hirc,
@@ -340,6 +356,26 @@ pub fn craft_bank(bank_id: u32, bank_name: &str, sounds: &[NewSound]) -> Result<
         push_u32(&mut event_body, 1); // action count
         push_u32(&mut event_body, action_id);
         push_object(&mut hirc, 0x04, &event_body);
+
+        if let Some(stop_id) = sound.stop_event_id {
+            let stop_action_id = stop_id ^ ACTION_ID_XOR;
+            // Stop_E_O (0x0103): targeted element, scoped to the posting
+            // game object. Unlike Play, the last u32 is exception count,
+            // not bank id. Empty properties mean an immediate stop.
+            let mut stop_body = Vec::with_capacity(17);
+            push_u32(&mut stop_body, stop_action_id);
+            stop_body.extend_from_slice(&[0x03, 0x01]);
+            push_u32(&mut stop_body, target_id);
+            stop_body.extend_from_slice(&[0, 0, 4]); // props, ranges, linear curve
+            push_u32(&mut stop_body, 0); // no exceptions
+            push_object(&mut hirc, 0x03, &stop_body);
+
+            let mut stop_event = Vec::with_capacity(12);
+            push_u32(&mut stop_event, stop_id);
+            push_u32(&mut stop_event, 1);
+            push_u32(&mut stop_event, stop_action_id);
+            push_object(&mut hirc, 0x04, &stop_event);
+        }
     }
     push_object(&mut hirc, 0x0E, &ATTENUATION_TEMPLATE);
 
@@ -362,6 +398,17 @@ pub fn craft_bank(bank_id: u32, bank_name: &str, sounds: &[NewSound]) -> Result<
     Ok(out)
 }
 
+/// The sound template's empty property bundle starts at +41, after
+/// parent and priority flags. Serialized bundle: u8 count, u8 ids[],
+/// then 4-byte values[] (no on-disk padding). Loop is property 6, an
+/// integer: 0 = infinite, 1 = one shot. Insert only after all other
+/// offset-based sound patches, including the perspective positioning splice.
+fn set_looping(body: &mut Vec<u8>, looping: bool) {
+    if looping {
+        body.splice(41..42, [1, 6, 0, 0, 0, 0]);
+    }
+}
+
 /// Patch ids before replacing the positioning block, since its length
 /// shifts the child list. All other donor fields remain unchanged.
 fn mixer_body(id: u32, child: u32, positioning: Positioning) -> Vec<u8> {
@@ -376,7 +423,7 @@ fn mixer_body(id: u32, child: u32, positioning: Positioning) -> Vec<u8> {
 /// 0xad34538a. It retains the node parameters and child playback flags,
 /// replaces the ids, and turns its two random containers into direct
 /// sounds.
-fn weapon_switch(id: u32, parent: u32, first: u32, third: u32) -> Vec<u8> {
+fn perspective_switch(id: u32, parent: u32, first: u32, third: u32) -> Vec<u8> {
     let mut out = vec![
         0, 0, 0, 0, // id
         0, 0, // FX override and count
@@ -408,6 +455,20 @@ fn weapon_switch(id: u32, parent: u32, first: u32, third: u32) -> Vec<u8> {
         out.extend_from_slice(&[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
     out
+}
+
+fn push_media(didx: &mut Vec<u8>, data: &mut Vec<u8>, id: u32, bytes: &[u8]) -> Result<()> {
+    let offset =
+        u32::try_from(data.len()).map_err(|_| AudioError::format("bank media exceeds 4 GiB"))?;
+    let len = u32::try_from(bytes.len()).map_err(|_| AudioError::format("clip exceeds 4 GiB"))?;
+    offset
+        .checked_add(len)
+        .ok_or_else(|| AudioError::format("bank media exceeds 4 GiB"))?;
+    for word in [id, offset, len] {
+        push_u32(didx, word);
+    }
+    data.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {

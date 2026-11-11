@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 audio.workspace = true
-pyo3 = { workspace = true, features = ["extension-module", "abi3-py314", "generate-import-lib"] }
-pyo3-stub-gen = "0.23"
+pyo3 = { workspace = true, features = ["abi3-py314", "generate-import-lib"] }
+pyo3-stub-gen.workspace = true
 
 [lints]
 workspace = true

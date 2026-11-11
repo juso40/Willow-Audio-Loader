@@ -1,14 +1,15 @@
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
 from unrealsdk import logging
 
-from blaudio.api import POSITIONING_MODES, Positioning
-from blaudio.ids import identifier
-from blaudio.objects import object_path
-from blaudio.runtime import add
+from .api import POSITIONING_MODES, Positioning, gain_value
+from .ids import identifier, stop_event_names
+from .objects import object_path
+from .runtime import add
+from .sources import ROUTING_MODES, Routing, SoundPool, SoundSource, Switch, source_spec
 
 ADD_SOUNDS = Path(__file__).parent / "add_sounds"
 
@@ -19,9 +20,13 @@ class AddManifest:
 
     namespace: str
     bank_name: str
-    sounds: dict[str, Path]
+    sounds: dict[str, SoundSource]
     positioning: dict[str, Positioning]
+    looping: dict[str, bool]
+    stop_events: dict[str, str]
+    routing: dict[str, Routing]
     manifest_path: Path
+    gain: dict[str, float] = field(default_factory=dict)
 
 
 def load_manifests() -> list[AddManifest]:
@@ -54,6 +59,10 @@ def apply_manifest(manifest: AddManifest) -> int:
         namespace=manifest.namespace,
         bank_name=manifest.bank_name,
         positioning=manifest.positioning,
+        looping=manifest.looping,
+        stop_events=manifest.stop_events,
+        routing=manifest.routing,
+        gain=manifest.gain,
     )
     logging.info(f"blaudio: loaded bank 0x{result.bank_id:08x} ({len(manifest.sounds)} sound(s))")
     ids = result.event_ids
@@ -71,12 +80,16 @@ def _parse_manifest(file: Path, data: dict[str, Any]) -> AddManifest:
     if not isinstance(entries, list) or not entries:
         raise ValueError("expected at least one [[sound]] table")
 
-    sounds: dict[str, Path] = {}
+    sounds: dict[str, SoundSource] = {}
     positioning: dict[str, Positioning] = {}
+    looping: dict[str, bool] = {}
+    stop_events: dict[str, str] = {}
+    routing: dict[str, Routing] = {}
+    gains: dict[str, float] = {}
     seen: set[str] = set()
     for index, raw in enumerate(entries):
         label = f"[[sound]] #{index}"
-        entry = _table(raw, label, {"name", "sound"}, {"positioning"})
+        entry = _table(raw, label, {"name", "sound"}, {"positioning", "loop", "stop_event", "routing", "gain"})
         name = identifier(entry["name"], f"{label} name")
         if name.casefold() in seen:
             raise ValueError(f"{label}: duplicate sound name {name!r}")
@@ -84,9 +97,23 @@ def _parse_manifest(file: Path, data: dict[str, Any]) -> AddManifest:
         mode = entry.get("positioning", "3d")
         if not isinstance(mode, str) or mode not in POSITIONING_MODES:
             raise ValueError(f"{label}: positioning must be one of {', '.join(POSITIONING_MODES)}, got {mode!r}")
-        sounds[name] = _sound_path(file, entry["sound"], label)
+        loop = entry.get("loop", False)
+        if not isinstance(loop, bool):
+            raise ValueError(f"{label}: loop must be a boolean, got {loop!r}")
+        route = entry.get("routing", "sfx")
+        if not isinstance(route, str) or route not in ROUTING_MODES:
+            raise ValueError(f"{label}: routing must be one of {', '.join(ROUTING_MODES)}")
+        gains[name] = gain_value(entry.get("gain", 0), f"{label} gain")
+        source = _sound_source(file, entry["sound"], label)
+        source_spec(source)
+        sounds[name] = source
+        routing[name] = cast(Routing, route)
         positioning[name] = cast(Positioning, mode)
-    return AddManifest(namespace, bank_name, sounds, positioning, file)
+        looping[name] = loop
+        if "stop_event" in entry:
+            stop_events[name] = identifier(entry["stop_event"], f"{label} stop_event")
+    stops = stop_event_names(sounds, stop_events)
+    return AddManifest(namespace, bank_name, sounds, positioning, looping, stops, routing, file, gains)
 
 
 def _table(
@@ -100,6 +127,40 @@ def _table(
     if missing := required - raw.keys():
         raise ValueError(f"{label}: missing required keys: {', '.join(sorted(missing))}")
     return raw
+
+
+def _sound_source(file: Path, raw: object, label: str, depth: int = 0) -> SoundSource:
+    """Decode an audio path, pool, or nested switch/state table."""
+    if depth > 16:
+        raise ValueError(f"{label}: sound tree exceeds maximum depth")
+    if isinstance(raw, str):
+        return _sound_path(file, raw, label)
+    if isinstance(raw, list):
+        return SoundPool([_sound_path(file, clip, label) for clip in raw])
+    if isinstance(raw, dict) and "clips" in raw:
+        table = _table(raw, label, {"clips"}, {"selection", "weights", "avoid_repeat", "scope"})
+        if not isinstance(table["clips"], list):
+            raise ValueError(f"{label}: clips must be an array of audio paths")
+        return SoundPool(
+            [_sound_path(file, clip, label) for clip in table["clips"]],
+            selection=table.get("selection", "random"),
+            weights=table.get("weights"),
+            avoid_repeat=table.get("avoid_repeat"),
+            scope=table.get("scope", "game_object"),
+        )
+    table = _table(raw, label, {"group", "branches", "default"}, {"kind"})
+    if not isinstance(table["branches"], dict):
+        raise ValueError(f"{label}: branches must be a table")
+    branches = {}
+    for state, branch in table["branches"].items():
+        if isinstance(branch, dict) and "silent" in branch:
+            _table(branch, label, {"silent"})
+            if branch["silent"] is not True:
+                raise ValueError(f"{label}: silent must be true")
+            branches[state] = None
+        else:
+            branches[state] = _sound_source(file, branch, label, depth + 1)
+    return Switch(table["group"], branches, table["default"], kind=table.get("kind", "switch"))
 
 
 def _sound_path(file: Path, raw: object, label: str) -> Path:

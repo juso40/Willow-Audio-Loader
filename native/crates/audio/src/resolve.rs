@@ -79,27 +79,20 @@ fn game_image() -> Option<(usize, &'static [u8])> {
 
 /// `SizeOfImage` from a PE32 image's first `0x1000` bytes. `None` when
 /// the bytes are not a PE32 image header.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn pe_image_size(headers: &[u8]) -> Option<usize> {
-    let read_u16 = |at: usize| {
-        let bytes = headers.get(at..at + 2)?;
-        Some(u16::from_le_bytes(bytes.try_into().expect("2 bytes")) as usize)
-    };
-    let read_u32 = |at: usize| {
-        let bytes = headers.get(at..at + 4)?;
-        Some(u32::from_le_bytes(bytes.try_into().expect("4 bytes")) as usize)
-    };
-    if read_u16(0)? != 0x5a4d {
+    if read_u16(headers, 0)? != 0x5a4d {
         return None; // "MZ"
     }
-    let nt = read_u32(0x3c)?;
-    if headers.get(nt..nt + 4)? != [b'P', b'E', 0, 0] {
+    let nt = read_u32(headers, 0x3c)? as usize;
+    if headers.get(nt..)?.get(..4)? != b"PE\0\0" {
         return None;
     }
-    if read_u16(nt + 24)? != 0x10b {
+    let optional = nt.checked_add(24)?;
+    if read_u16(headers, optional)? != 0x10b {
         return None; // PE32 only (the games are 32-bit)
     }
-    read_u32(nt + 24 + 56)
+    read_u32(headers, optional.checked_add(56)?).map(|size| size as usize)
 }
 
 /// The symbol table's three arrays inside a mapped game image (offsets
@@ -158,7 +151,7 @@ fn resolve_in(image: &[u8], base: usize, name: &str) -> Option<usize> {
     if sym_rva == 0 || sym_rva >= image.len() {
         return None;
     }
-    Some(base + sym_rva)
+    base.checked_add(sym_rva)
 }
 
 /// Finds and validates the table header. The anchor string's pointer
@@ -237,7 +230,7 @@ fn unique_rva(image: &[u8], needle: &[u8]) -> Option<usize> {
     if matches.len() != 1 {
         return None;
     }
-    matches[0].into()
+    Some(matches[0])
 }
 
 /// Every offset in `image` whose little-endian `u32` equals `value`.
@@ -283,12 +276,12 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
 
 /// The little-endian `u32` at `at`, `None` when out of bounds.
 fn read_u32(image: &[u8], at: usize) -> Option<u32> {
-    let bytes = image.get(at..at + 4)?;
+    let bytes = image.get(at..)?.get(..4)?;
     Some(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
 }
 
 /// The little-endian `u16` at `at`, `None` when out of bounds.
 fn read_u16(image: &[u8], at: usize) -> Option<u16> {
-    let bytes = image.get(at..at + 2)?;
+    let bytes = image.get(at..)?.get(..2)?;
     Some(u16::from_le_bytes(bytes.try_into().expect("2 bytes")))
 }

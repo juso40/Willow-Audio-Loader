@@ -1,28 +1,23 @@
-"""High-level audio operations: reserve ids, load banks, and wire game objects.
-
-Reservations are released on pre-load failure and committed immediately
-once Wwise holds the bank. Unreal object creation must not undo that commit.
-"""
-
-
+import json
 from collections.abc import Mapping
 from hashlib import sha256
-from pathlib import Path
 from typing import Any, NamedTuple
 
 import unrealsdk
 from mods_base import get_pc
+from unrealsdk import unreal
 from unrealsdk.unreal import UObject
 
 from . import api
-from .api import POSITIONING_MODES, Positioning
-from .ids import SoundKey, identifier, registry
+from .api import Positioning
+from .ids import SoundKey, identifier, registry, stop_event_names
 from .objects import create_bank, create_event, find_event, object_path, relink_event
+from .sources import Routing, SoundSource, extra_masks, read_source, resolved_source, source_spec
 
-__all__ = ["AddResult", "add", "get_added_event", "play", "play_id", "replace", "replace_bytes"]
+__all__ = ["AddResult", "add", "get_added_event", "play", "play_id", "replace", "replace_bytes", "stop"]
 
 ObjectLike = str | UObject
-SoundMap = Mapping[SoundKey, api.AudioSource]
+SoundMap = Mapping[SoundKey, SoundSource]
 PositioningMap = Positioning | dict[SoundKey, Positioning]
 
 
@@ -39,12 +34,16 @@ class AddResult(NamedTuple):
         return {key: int(event.ShortId) & 0xFFFFFFFF for key, event in self.events.items()}
 
 
-def add(
+def add(  # noqa: PLR0913 - keep explicit keyword-only options for callers
     sounds: SoundMap,
     *,
     namespace: str,
     bank_name: str,
     positioning: PositioningMap = "3d",
+    looping: bool | dict[SoundKey, bool] = False,
+    stop_events: Mapping[SoundKey, str] | None = None,
+    routing: Routing | dict[SoundKey, Routing] = "sfx",
+    gain: float | dict[SoundKey, float] = 0,
 ) -> AddResult:
     """Allocate ids, load a sound bank, and create its AkBank/AkEvent objects.
 
@@ -54,7 +53,15 @@ def add(
     Banks use `Transient.<namespace>.<bank_name>` and events below that
     bank as `<name>`. For explicit ids, use api.craft_bank and api.load_bank.
 
+    Sources may be audio paths/bytes, SoundPool, or nested Switch trees.
+    `routing` accepts sfx, voice, or player_voice (global or per event).
+    `gain` is a global/per-event offset in dB (-96..+12, default 0).
     `positioning` accepts a global mode or per-sound overrides (default 3D).
+    `looping` accepts a global boolean or per-sound overrides (default false).
+    True repeats until stopped. Posting again starts another instance.
+    `stop_events` maps sound names to companion event names. These are
+    returned in `events` too and stop the sound on the actor posting them.
+    Companion names must be unique among all event names in the bank.
     The registry checks loaded AkObjects and our reserved ids, including
     derived HIRC ids. It cannot see unloaded game banks or arbitrary
     external Wwise nodes. Repeating a bank with different bytes requires
@@ -63,28 +70,48 @@ def add(
     ```python
     result = add(
         {"shot": "shot.wav", "reload": "reload.mp3"},
-        namespace="my_mod", bank_name="Weapons", positioning="weapon",
+        namespace="my_mod", bank_name="Weapons", positioning="perspective",
     )
     play(result.events["shot"])
     ```
     """
-    # validate the identifiers
+    # Validate identifiers before reserving ids or constructing objects.
     identifier(namespace, "namespace")
     identifier(bank_name, "bank_name")
     for name in sounds:
         identifier(name, "sound name")
 
     modes: dict[SoundKey, Positioning] = api.positioning_modes(sounds, positioning)
+    loops = api.looping_modes(sounds, looping)
+    routes = api.routing_modes(sounds, routing)
+    gains = api.gain_modes(sounds, gain)
+    specs = {name: source_spec(source) for name, source in sounds.items()}
+    masks = {name: extra_masks(spec, modes[name]) for name, spec in specs.items()}
+    stops = stop_event_names(sounds, stop_events)
     object_name = f"{namespace}.{bank_name}"
-    with registry.reserve(bank_name, namespace, modes) as allocation:
-        resolved = {allocation.event_ids[key]: source for key, source in sounds.items()}
+    with registry.reserve(bank_name, namespace, modes, stop_events=stops, source_masks=masks) as allocation:
+        # Use the validated shape, not mutable caller-owned lists/mappings.
+        # Unreal lookups or other callbacks must not change the tree after
+        # its derived ids have been reserved.
+        resolved = {allocation.event_ids[key]: resolved_source(spec) for key, spec in specs.items()}
         resolved_modes: dict[int, Positioning] = {allocation.event_ids[key]: mode for key, mode in modes.items()}
+        resolved_loops = {allocation.event_ids[key]: loop for key, loop in loops.items()}
+        resolved_stops = {allocation.event_ids[key]: allocation.event_ids[name] for key, name in stops.items()}
 
         _check_named_object("AkBank", object_name, allocation.bank_id)
         for name, event_id in allocation.event_ids.items():
             _check_named_object("AkEvent", f"{object_name}.{name}", event_id)
 
-        data = api.craft_bank(allocation.bank_id, resolved, bank_name=object_name, positioning=resolved_modes)
+        data = api.craft_bank(
+            allocation.bank_id,
+            resolved,
+            bank_name=object_name,
+            positioning=resolved_modes,
+            looping=resolved_loops,
+            stop_events=resolved_stops,
+            routing={allocation.event_ids[key]: route for key, route in routes.items()},
+            gain={allocation.event_ids[key]: value for key, value in gains.items()},
+        )
         registry.check_bank(allocation, data)
         loaded_id = api.load_bank(data)
         registry.commit(allocation, data)
@@ -94,6 +121,10 @@ def add(
         events: dict[SoundKey, Any] = {}
         for name, event_id in allocation.event_ids.items():
             event = create_event(f"{object_name}.{name}", event_id, bank_obj)
+            if routes.get(name, "sfx") != "sfx":
+                # Only Play events are voices. Companion Stops carry no speech.
+                with unreal.notify_changes():
+                    event.bVoice = True
             registry.track_objects([event])
             registry.remember_event(event)
             events[name] = event
@@ -115,53 +146,74 @@ def get_added_event(name: str, *, namespace: str, bank_name: str) -> Any:
     """Get a previously added named event, comparing names case-insensitively.
 
     Raises KeyError if no event was created this session. Does not allocate
-    or load anything. name is the original sound key, not its object path.
+    or load anything. name is a sound or companion Stop event name,
+    not its object path.
     """
     return registry.get_event(name, namespace, bank_name)
 
 
-def replace(sound: str | Path, target: ObjectLike, *, positioning: Positioning = "3d") -> str:
-    """Relink an existing AkEvent to new audio, without modifying game files.
+def replace(
+    sound: SoundSource,
+    target: ObjectLike,
+    *,
+    positioning: Positioning = "3d",
+    routing: Routing = "sfx",
+    gain: float = 0,
+) -> str:
+    """Relink an existing AkEvent to an audio clip or selection tree.
 
-    Keep the object identity so existing references play the new audio.
-    Raw Wwise posts of the original id keep their original behavior.
-    Cannot infer the original positioning or preserve a multi-action graph.
-
-    Repeating a target, audio and mode reuses its replacement bank.
-    Changed audio or mode loads a new bank. Keep all allocated ids and
-    loaded buffers until the game exits, including earlier replacements.
+    All callers of that Unreal object see the change. Raw posts of its old
+    id do not. This replaces, rather than merges, the original Wwise graph.
+    Identical target/content/settings reuse a bank. Changed content loads a
+    new bank, retained until game exit. Never modify game files.
     """
-    return replace_bytes(Path(sound).read_bytes(), target, positioning=positioning)
-
-
-def replace_bytes(data: bytes, target: ObjectLike, *, positioning: Positioning = "3d") -> str:
-    """Like replace, for in-memory audio bytes. Never create an AkEvent."""
     event = find_event(target)
     path = object_path(event)
-    if not isinstance(positioning, str) or positioning not in POSITIONING_MODES:
-        raise ValueError(f"invalid positioning {positioning!r}. Expected {', '.join(POSITIONING_MODES)}")
-
-    modes: dict[SoundKey, Positioning] = {"sound": positioning}
-    digest = sha256(path.encode() + b"\0" + positioning.encode() + b"\0" + data).hexdigest()
+    positioning = api.positioning_modes({"sound": sound}, positioning)["sound"]
+    api.routing_modes({"sound": sound}, routing)
+    gain = api.gain_value(gain)
+    spec = read_source(source_spec(sound))
+    # Hash a framed tree, not concatenated media. Branch ids, order, weights,
+    # selection mode, scope, routing and every clip contribute to the key.
+    description = json.dumps(
+        spec,
+        sort_keys=True,
+        default=lambda data: {
+            "sha256": sha256(data).hexdigest(),
+            "length": len(data),
+        },
+    )
+    digest = sha256(json.dumps([path, positioning, routing, description, gain]).encode()).hexdigest()
     name = f"Replacement_{digest}"
-
-    with registry.reserve(name, "blaudio_replace", modes) as allocation:
+    modes: dict[SoundKey, Positioning] = {"sound": positioning}
+    with registry.reserve(
+        name, "blaudio_replace", modes, source_masks={"sound": extra_masks(spec, positioning)}
+    ) as allocation:
         event_id = allocation.event_ids["sound"]
         object_name = f"blaudio_replace_{name}_{allocation.bank_id:08X}"
-
-        bank_data = api.craft_bank(allocation.bank_id, {event_id: data}, bank_name=object_name, positioning=positioning)
+        bank_data = api.craft_bank(
+            allocation.bank_id,
+            {event_id: resolved_source(spec)},
+            bank_name=object_name,
+            positioning=positioning,
+            routing=routing,
+            gain=gain,
+        )
         registry.check_bank(allocation, bank_data)
-
         loaded_id = api.load_bank(bank_data)
         registry.commit(allocation, bank_data)
-
         bank = create_bank(object_name, loaded_id)
         registry.track_objects([bank])
-
-        relink_event(event, event_id, bank)
+        relink_event(event, event_id, bank, voice=True if routing != "sfx" else None)
         registry.track_objects([event])
+    return f"relink {path} to event 0x{event_id:08x} in runtime bank 0x{loaded_id:08x} ({positioning}, {routing})"
 
-    return f"relink {path} to event 0x{event_id:08x} in runtime bank 0x{loaded_id:08x} ({positioning})"
+
+def replace_bytes(
+    data: bytes, target: ObjectLike, *, positioning: Positioning = "3d", routing: Routing = "sfx", gain: float = 0
+) -> str:
+    """Like replace, for in-memory audio bytes. Never create an AkEvent."""
+    return replace(data, target, positioning=positioning, routing=routing, gain=gain)
 
 
 def play(event: ObjectLike) -> None:
@@ -175,6 +227,17 @@ def play(event: ObjectLike) -> None:
     pc = get_pc()
     actor = pc.Pawn if pc.Pawn is not None else pc
     actor.PlayAkEvent(event)
+
+
+def stop(event: ObjectLike, *, fade_ms: int = 0) -> bool:
+    """Stop an AkEvent's instances on all emitters, optionally fading out.
+
+    This includes instances posted by other callers using the same event.
+    Use api.stop_event for emitter-scoped stopping or api.stop_playing_id
+    for one raw-post instance. True means Wwise accepted the queued action,
+    not that playback has already stopped. Does not create or unload banks.
+    """
+    return api.stop_event(int(find_event(event).ShortId), fade_ms=fade_ms)
 
 
 def play_id(event_id: int) -> None:

@@ -9,20 +9,20 @@
 //! u8[4] magic = "AKPK"
 //! u32   header_size          // total header size minus these 8 bytes
 //! u32   version              // 1
-//! u32   entry_size           // 20
+//! u32   language_table_size  // includes count, offset/id pairs, UTF-16 names
 //! u32   banks_table_size     // u32 count + count * entry_size
 //! u32   streams_table_size   // u32 count + count * entry_size
 //! u32   externals_table_size // always 4 (empty) in every observed pck
-//! u32   language_count
-//! u32   language_table_size  // bytes. Per entry: u32 id + UTF-16LE name, NUL-terminated
 //! [languages][banks table][streams table][externals table]
+//! languages: u32 count, {u32 name_offset, u32 language_id}[count], then
+//! NUL-terminated UTF-16LE names. Offsets are relative to the language block.
 //! u8    data[]               // entry payloads, contiguous, offsets absolute
 //! ```
 //!
-//! Each entry is `{id, flags, size, offset, reserved}` (5 × u32 LE).
+//! Each entry is `{id, flags, size, offset, language_id}` (5 × u32 LE).
 //! Bank entry ids are **bank** ids. Stream entry ids are **media** ids,
 //! the same ids the engine's loose-file resolver turns into `%u.bnk` /
-//! `%u.wem` (see `docs/audio-recon.md`). Read stream entries directly and
+//! `%u.wem`. Read stream entries directly and
 //! bank-embedded media through `DIDX` (module [`crate::bank`]).
 //!
 //! This module only reads archives. Craft new banks in memory through
@@ -36,9 +36,8 @@ use crate::error::{AudioError, Result};
 pub const MAGIC: [u8; 4] = *b"AKPK";
 /// Entry size in BL2 archives (5 × u32).
 pub const ENTRY_SIZE: usize = 20;
-/// Fixed header bytes up to the language table
-/// (magic + `header_size` + 7 × u32).
-const FIXED_HEADER: usize = 0x24;
+/// Fixed header before the language block (count belongs to that block).
+const FIXED_HEADER: usize = 0x1c;
 
 /// Which payload table an entry lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,11 +72,11 @@ pub struct PckEntry {
     pub size: u32,
     /// Absolute file offset of the payload.
     pub offset: u32,
-    /// `0` in every observed entry. Preserved verbatim.
-    pub reserved: u32,
+    /// Language id (0 for SFX, 1 for English in the observed localized pack).
+    pub language_id: u32,
 }
 
-/// One language-table entry. Every observed pck holds a single `sfx`.
+/// One language-table entry, e.g. `sfx` or `english(us)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Language {
     /// Language id (`0` for `sfx`).
@@ -127,17 +126,10 @@ impl Pck {
         }
         let header_size = get_u32(&data, 0x04)? as usize;
         let version = get_u32(&data, 0x08)?;
-        let entry_size = get_u32(&data, 0x0c)? as usize;
-        if entry_size != ENTRY_SIZE {
-            return Err(AudioError::format(format!(
-                "unsupported pck entry size {entry_size} (expected {ENTRY_SIZE})"
-            )));
-        }
+        let language_size = get_u32(&data, 0x0c)? as usize;
         let banks_size = get_u32(&data, 0x10)? as usize;
         let streams_size = get_u32(&data, 0x14)? as usize;
         let externals_size = get_u32(&data, 0x18)? as usize;
-        let language_count = get_u32(&data, 0x1c)? as usize;
-        let language_size = get_u32(&data, 0x20)? as usize;
 
         let tables_end = FIXED_HEADER
             .checked_add(language_size)
@@ -145,22 +137,17 @@ impl Pck {
             .and_then(|pos| pos.checked_add(streams_size))
             .and_then(|pos| pos.checked_add(externals_size))
             .ok_or_else(|| AudioError::format("pck header sizes overflow"))?;
-        if header_size + 8 != tables_end {
+        if header_size.checked_add(8) != Some(tables_end) {
             return Err(AudioError::format(format!(
                 "pck header_size {header_size:#x} disagrees with table sizes (expected {:#x})",
                 tables_end - 8
             )));
         }
 
-        let (languages, pos) = parse_languages(&data, FIXED_HEADER, language_count, language_size)?;
+        let (languages, pos) = parse_languages(&data, FIXED_HEADER, language_size)?;
         let (banks, pos) = parse_table(&data, pos, banks_size)?;
         let (streams, pos) = parse_table(&data, pos, streams_size)?;
-        let (externals, pos) = parse_table(&data, pos, externals_size)?;
-        if pos != tables_end {
-            return Err(AudioError::format(format!(
-                "pck tables end at {pos:#x}, expected {tables_end:#x}"
-            )));
-        }
+        let (externals, _) = parse_table(&data, pos, externals_size)?;
 
         let package = Self {
             version,
@@ -188,7 +175,7 @@ impl Pck {
         self.data.len()
     }
 
-    fn entries(&self, kind: TableKind) -> &Vec<PckEntry> {
+    fn entries(&self, kind: TableKind) -> &[PckEntry] {
         match kind {
             TableKind::Banks => &self.banks,
             TableKind::Streams => &self.streams,
@@ -203,7 +190,9 @@ impl Pck {
             .get(index)
             .ok_or_else(|| AudioError::format(format!("no entry #{index} in {}", kind.label())))?;
         let start = entry.offset as usize;
-        let end = start + entry.size as usize;
+        let end = start.checked_add(entry.size as usize).ok_or_else(|| {
+            AudioError::format(format!("entry 0x{:08x} payload range overflows", entry.id))
+        })?;
         self.data.get(start..end).ok_or_else(|| {
             AudioError::format(format!(
                 "entry 0x{:08x} payload {start:#x}..{end:#x} is out of bounds",
@@ -262,32 +251,41 @@ impl Pck {
 }
 
 fn get_u32(data: &[u8], pos: usize) -> Result<u32> {
-    let bytes = data.get(pos..pos + 4).ok_or_else(|| {
-        AudioError::format(format!("field at {pos:#x} runs past the end of the data"))
-    })?;
+    let bytes = data
+        .get(pos..)
+        .and_then(|tail| tail.get(..4))
+        .ok_or_else(|| {
+            AudioError::format(format!("field at {pos:#x} runs past the end of the data"))
+        })?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn parse_languages(
-    data: &[u8],
-    start: usize,
-    count: usize,
-    size: usize,
-) -> Result<(Vec<Language>, usize)> {
-    let end = start + size;
+fn parse_languages(data: &[u8], start: usize, size: usize) -> Result<(Vec<Language>, usize)> {
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| AudioError::format("language size overflow"))?;
     let table = data
         .get(start..end)
         .ok_or_else(|| AudioError::format("language table out of bounds"))?;
+    let count = get_u32(table, 0)? as usize;
+    if count > size.saturating_sub(4) / 8 {
+        return Err(AudioError::format("language directory out of bounds"));
+    }
     let mut languages = Vec::with_capacity(count);
-    let mut pos = 0;
-    for _ in 0..count {
-        let id = get_u32(table, pos)?;
-        pos += 4;
+    for index in 0..count {
+        let mut pos = get_u32(table, 4 + index * 8)? as usize;
+        let id = get_u32(table, 8 + index * 8)?;
+        if pos < 4 + count * 8 || !pos.is_multiple_of(2) {
+            return Err(AudioError::format("invalid language name offset"));
+        }
         let mut units = Vec::new();
         loop {
-            let unit = table.get(pos..pos + 2).ok_or_else(|| {
-                AudioError::format("language name runs past the end of the table")
-            })?;
+            let unit = table
+                .get(pos..)
+                .and_then(|tail| tail.get(..2))
+                .ok_or_else(|| {
+                    AudioError::format("language name runs past the end of the table")
+                })?;
             pos += 2;
             let unit = u16::from_le_bytes([unit[0], unit[1]]);
             if unit == 0 {
@@ -299,26 +297,25 @@ fn parse_languages(
             .map_err(|_| AudioError::format("language name is not valid UTF-16"))?;
         languages.push(Language { id, name });
     }
-    if pos != size {
-        return Err(AudioError::format(format!(
-            "language table is {size} bytes, contents consume {pos}"
-        )));
-    }
     Ok((languages, end))
 }
 
 fn parse_table(data: &[u8], start: usize, size: usize) -> Result<(Vec<PckEntry>, usize)> {
-    let end = start + size;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| AudioError::format("table size overflow"))?;
+    if end > data.len() {
+        return Err(AudioError::format("archive table out of bounds"));
+    }
     if size < 4 {
         return Err(AudioError::format(format!(
             "table at {start:#x} is smaller than its count field"
         )));
     }
     let count = get_u32(data, start)? as usize;
-    if 4 + count * ENTRY_SIZE != size {
+    if count.checked_mul(ENTRY_SIZE).and_then(|n| n.checked_add(4)) != Some(size) {
         return Err(AudioError::format(format!(
-            "table at {start:#x}: {count} entries of {ENTRY_SIZE} bytes need {}, header says {size}",
-            4 + count * ENTRY_SIZE
+            "table at {start:#x}: {count} entries of {ENTRY_SIZE} bytes disagree with size {size}"
         )));
     }
     let mut entries = Vec::with_capacity(count);
@@ -329,7 +326,7 @@ fn parse_table(data: &[u8], start: usize, size: usize) -> Result<(Vec<PckEntry>,
             flags: get_u32(data, pos + 4)?,
             size: get_u32(data, pos + 8)?,
             offset: get_u32(data, pos + 12)?,
-            reserved: get_u32(data, pos + 16)?,
+            language_id: get_u32(data, pos + 16)?,
         });
     }
     Ok((entries, end))

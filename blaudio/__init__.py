@@ -3,8 +3,8 @@ from argparse import Namespace
 from mods_base import Library, build_mod, command
 from unrealsdk.logging import error, misc
 
-from blaudio import api
-from blaudio.api import (
+from . import api
+from .api import (
     POSITIONING_MODES,
     Positioning,
     craft_bank,
@@ -14,18 +14,24 @@ from blaudio.api import (
     probe,
     register_game_object,
     set_active_listeners,
+    stop_event,
+    stop_playing_id,
     to_wem,
     unload_bank,
 )
-from blaudio.auto_add import apply_manifest as apply_add_manifest
-from blaudio.auto_add import load_manifests as load_add_manifests
-from blaudio.objects import create_bank, create_event
-from blaudio.runtime import AddResult, add, get_added_event, play, play_id, replace, replace_bytes
+from .auto_add import apply_manifest as apply_add_manifest
+from .auto_add import load_manifests as load_add_manifests
+from .objects import create_bank, create_event
+from .runtime import AddResult, add, get_added_event, play, play_id, replace, replace_bytes, stop
+from .sources import Routing, SoundPool, Switch
 
 __all__ = [
     "POSITIONING_MODES",
     "AddResult",
     "Positioning",
+    "Routing",
+    "SoundPool",
+    "Switch",
     "add",
     "craft_bank",
     "create_bank",
@@ -41,6 +47,9 @@ __all__ = [
     "replace",
     "replace_bytes",
     "set_active_listeners",
+    "stop",
+    "stop_event",
+    "stop_playing_id",
     "to_wem",
     "unload_bank",
 ]
@@ -52,7 +61,6 @@ def _command(args: Namespace) -> None:
         print(api.probe(args.target or "Audio_Streaming.pck"))
 
 
-
 _command.add_argument(
     "subcommand",
     choices=["probe"],
@@ -62,7 +70,7 @@ _command.add_argument(
     "target",
     nargs="?",
     default=None,
-    help="probe: archive to dump (bare names resolve to WillowGame/CookedPCConsole). "
+    help="probe: archive to dump (bare names resolve to WillowGame/CookedPCConsole). ",
 )
 
 

@@ -3,7 +3,7 @@
 //! Streamed and bank-embedded media alike are whole `.wem` files
 //! (`RIFF....WAVE` with `fmt ` + `data`). Every stream sampled from BL2's
 //! `Audio_Streaming.pck` carries fmt tag `0xFFFF` with a 48-byte extension,
-//!  the 2011+ Wwise encoding.
+//! the 2011+ Wwise encoding.
 //! The engine's Wwise build compiles the Vorbis source codecs
 //! (`CAkSrcBankVorbis` / `CAkSrcFileVorbis` RTTI in `Borderlands2.exe`),
 //! so that tag maps to [`WemCodec::WwiseVorbis`] here. Bank PCM must be
@@ -69,24 +69,47 @@ const PCM_SUBTYPE_GUID: [u8; 16] = [
 /// rejects anything but `0xFFFE` with `AK_InvalidFile`, then reads the
 /// rate at +4, block align at +12, bits at +14 and the channel mask at
 /// +20 out of the extensible block. A plain `0x0001` PCM `.wem`, the
-/// obvious shape, plays nothing.
-pub fn write_pcm_wem(pcm: &[u8], channels: u16, sample_rate: u32) -> Vec<u8> {
-    let block_align = channels * 2;
+/// obvious shape, plays nothing. Invalid geometry, partial sample frames,
+/// and lengths or byte rates that exceed the RIFF fields return an error.
+pub fn write_pcm_wem(pcm: &[u8], channels: u16, sample_rate: u32) -> Result<Vec<u8>> {
+    if channels == 0 || sample_rate == 0 {
+        return Err(AudioError::format(
+            "PCM needs nonzero channels and sample rate",
+        ));
+    }
+    let block_align = channels
+        .checked_mul(2)
+        .ok_or_else(|| AudioError::format("PCM block alignment exceeds uint16"))?;
+    if !pcm.len().is_multiple_of(usize::from(block_align)) {
+        return Err(AudioError::format("PCM ends inside a sample frame"));
+    }
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or_else(|| AudioError::format("PCM byte rate exceeds uint32"))?;
+    let data_size =
+        u32::try_from(pcm.len()).map_err(|_| AudioError::format("PCM exceeds 4 GiB"))?;
+    let riff_size = data_size
+        .checked_add(60)
+        .ok_or_else(|| AudioError::format("PCM RIFF exceeds 4 GiB"))?;
+    let capacity = pcm
+        .len()
+        .checked_add(68)
+        .ok_or_else(|| AudioError::format("PCM buffer size overflows"))?;
     let channel_mask: u32 = match channels {
         1 => 0x4, // SPEAKER_FRONT_CENTER
         2 => 0x3, // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
         n => (1u32 << n.min(18)) - 1,
     };
-    let mut out = Vec::with_capacity(pcm.len() + 58);
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&0u32.to_le_bytes()); // patched below
+    out.extend_from_slice(&riff_size.to_le_bytes());
     out.extend_from_slice(b"WAVE");
     out.extend_from_slice(b"fmt ");
     out.extend_from_slice(&40u32.to_le_bytes());
     out.extend_from_slice(&0xFFFEu16.to_le_bytes()); // WAVE_FORMAT_EXTENSIBLE
     out.extend_from_slice(&channels.to_le_bytes());
     out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(&(sample_rate * block_align as u32).to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
     out.extend_from_slice(&block_align.to_le_bytes());
     out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
     out.extend_from_slice(&22u16.to_le_bytes()); // cbSize
@@ -94,11 +117,9 @@ pub fn write_pcm_wem(pcm: &[u8], channels: u16, sample_rate: u32) -> Vec<u8> {
     out.extend_from_slice(&channel_mask.to_le_bytes());
     out.extend_from_slice(&PCM_SUBTYPE_GUID);
     out.extend_from_slice(b"data");
-    out.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    out.extend_from_slice(&data_size.to_le_bytes());
     out.extend_from_slice(pcm);
-    let riff_size = (out.len() - 8) as u32;
-    out[4..8].copy_from_slice(&riff_size.to_le_bytes());
-    out
+    Ok(out)
 }
 
 /// Parsed `fmt ` essentials of one `.wem`.
@@ -136,7 +157,7 @@ pub fn parse(data: &[u8]) -> Result<WemHeader> {
         let id = &data[pos..pos + 4];
         let size = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
             as usize;
-        let payload = data.get(pos + 8..pos + 8 + size).ok_or_else(|| {
+        let payload = data[pos + 8..].get(..size).ok_or_else(|| {
             AudioError::format(format!(
                 "chunk {:?} overruns the file",
                 String::from_utf8_lossy(id)
@@ -166,12 +187,13 @@ fn parse_fmt(payload: &[u8]) -> Result<WemHeader> {
     let fmt_extension = match payload.get(16..18) {
         Some(size_bytes) => {
             let cb_size = u16::from_le_bytes([size_bytes[0], size_bytes[1]]) as usize;
-            payload
-                .get(18..18 + cb_size)
-                .unwrap_or(&payload[18..])
+            payload[18..]
+                .get(..cb_size)
+                .ok_or_else(|| AudioError::format("fmt extension overruns the fmt chunk"))?
                 .to_vec()
         }
-        None => Vec::new(),
+        None if payload.len() == 16 => Vec::new(),
+        None => return Err(AudioError::format("truncated fmt extension size")),
     };
     Ok(WemHeader {
         codec: WemCodec::from_fmt_tag(fmt_tag),
@@ -192,40 +214,4 @@ pub fn describe(data: &[u8]) -> String {
         ),
         Err(_) => format!("raw bytes (leading {:02x?})", &data[..data.len().min(4)]),
     }
-}
-
-/// Caveats for a replacement: codec mismatches when both payloads are
-/// `.wem`s, and a note when replacing a `.wem` with non-`.wem` bytes.
-/// Raw-to-raw swaps (bank media) are unchecked by design, the caller
-/// supplies the format the consumer expects.
-pub fn codec_warnings(old: &[u8], new: &[u8]) -> Vec<String> {
-    let mut warnings = Vec::new();
-    match (is_wem(old), is_wem(new)) {
-        (true, true) => {
-            if let (Ok(old), Ok(new)) = (parse(old), parse(new)) {
-                if old.codec != new.codec {
-                    warnings.push(format!(
-                        "codec mismatch: original is {:?}, replacement is {:?}",
-                        old.codec, new.codec
-                    ));
-                }
-                if old.channels != new.channels {
-                    warnings.push(format!(
-                        "channel mismatch: original is {}ch, replacement is {}ch. \
-                         The existing bank's positioning settings stay unchanged",
-                        old.channels, new.channels
-                    ));
-                }
-            }
-        }
-        (true, false) => {
-            warnings.push(
-                "replacement is not a RIFF/WAVE .wem but the original is. \
-                 The consumer expects the same wrapping"
-                    .to_owned(),
-            );
-        }
-        _ => {}
-    }
-    warnings
 }
